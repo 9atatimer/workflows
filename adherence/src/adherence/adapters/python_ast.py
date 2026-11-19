@@ -1,0 +1,765 @@
+"""adapters/python_ast.py -- CodeModelPort for Python.
+
+Facts come from the standard library `ast` over the bytes the use case
+handed over; nothing in the sources is imported or run (ARCHITECTURE.
+ARCH-ADHERENCE.md, Security mitigations). A source that does not parse is
+Unparsed, for the use case to report as coverage.
+"""
+
+from __future__ import annotations
+
+import ast
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
+
+from adherence.adapters.python_imports import (
+    INIT,
+    ImportGraphFailed,
+    import_edges,
+    module_names,
+    modules_of,
+)
+from adherence.adapters.python_names import (
+    FileNames,
+    Resolver,
+    chain,
+    expanded,
+    imported_names,
+)
+from adherence.domain.deadline import Deadline, TimedOut
+from adherence.domain.declaration import Declaration, layer_of, marker_regions
+from adherence.domain.model import (
+    Access,
+    AccessKind,
+    Assertion,
+    Binding,
+    Body,
+    Call,
+    CodeModel,
+    Conditional,
+    Definition,
+    Member,
+    MemberKind,
+    Parameter,
+    Reference,
+    ReferenceKind,
+    Region,
+    Signature,
+    TestCase,
+    Unit,
+    UnitKind,
+    Unparsed,
+    Write,
+    merged,
+)
+from adherence.domain.parameters import Vocabulary
+from adherence.domain.source import source_lines
+
+# --- Constants ---------------------------------------------------------------
+
+DEFINITIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+# --- Helpers -----------------------------------------------------------------
+
+
+def _passed(deadline: Deadline | None, now: float) -> bool:
+    return deadline is not None and deadline.epoch_seconds <= now
+
+
+def _parse(path: str, data: bytes) -> ast.Module | Unparsed:
+    try:
+        return ast.parse(data, filename=path)
+    except (SyntaxError, ValueError, RecursionError) as error:
+        return Unparsed(path, f"not Python: {error}")
+
+
+DefinitionNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+
+
+@dataclass(frozen=True, slots=True)
+class _Found:
+    symbol: str
+    node: DefinitionNode
+    parent: str | None
+    nested: bool
+
+
+def _walk_definitions(
+    tree: ast.AST, scope: str | None = None, in_function: bool = False
+) -> list[_Found]:
+    """Every definition under a node, with its qualified symbol, in order."""
+    found: list[_Found] = []
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, DEFINITIONS):
+            symbol = f"{scope}.{node.name}" if scope else node.name
+            found.append(_Found(symbol, node, scope, in_function))
+            is_function = not isinstance(node, ast.ClassDef)
+            found.extend(_walk_definitions(node, symbol, in_function or is_function))
+        else:
+            found.extend(_walk_definitions(node, scope, in_function))
+    return found
+
+
+def _text(node: ast.expr | None) -> str | None:
+    return None if node is None else ast.unparse(node)
+
+
+def _signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> Signature:
+    arguments = node.args
+    positional = [*arguments.posonlyargs, *arguments.args]
+    first_default = len(positional) - len(arguments.defaults)
+    parameters = [
+        Parameter(arg.arg, _text(arg.annotation), False, index >= first_default)
+        for index, arg in enumerate(positional)
+    ]
+    if arguments.vararg is not None:
+        vararg = arguments.vararg
+        parameters.append(
+            Parameter(f"*{vararg.arg}", _text(vararg.annotation), False, False)
+        )
+    parameters.extend(
+        Parameter(arg.arg, _text(arg.annotation), True, default is not None)
+        for arg, default in zip(
+            arguments.kwonlyargs, arguments.kw_defaults, strict=True
+        )
+    )
+    if arguments.kwarg is not None:
+        kwarg = arguments.kwarg
+        parameters.append(
+            Parameter(f"**{kwarg.arg}", _text(kwarg.annotation), False, False)
+        )
+    return Signature(tuple(parameters), _text(node.returns))
+
+
+def own_nodes(node: ast.AST) -> list[ast.AST]:
+    """Every node inside a definition, not descending into the definitions
+    nested in it, which are their own units."""
+    found: list[ast.AST] = []
+    for child in ast.iter_child_nodes(node):
+        found.append(child)
+        if not isinstance(child, DEFINITIONS):
+            found.extend(own_nodes(child))
+    return found
+
+
+def _statements(node: DefinitionNode) -> list[ast.stmt]:
+    """The body's statements without a leading docstring."""
+    body = list(node.body)
+    first = body[0] if body else None
+    if (
+        isinstance(first, ast.Expr)
+        and isinstance(first.value, ast.Constant)
+        and isinstance(first.value.value, str)
+    ):
+        body = body[1:]
+    return body
+
+
+def _placeholder(node: DefinitionNode) -> str | None:
+    """The placeholder form a body consists of, if it is nothing but one."""
+    statements = _statements(node)
+    if len(statements) != 1:
+        return None
+    only = statements[0]
+    if isinstance(only, ast.Pass):
+        return "pass"
+    if isinstance(only, ast.Expr) and isinstance(only.value, ast.Constant):
+        if only.value.value is Ellipsis:
+            return "..."
+    return _raised(only)
+
+
+def _raised(statement: ast.stmt) -> str | None:
+    """The name of the exception a `raise` statement raises, if it is one."""
+    if isinstance(statement, ast.Raise) and statement.exc is not None:
+        exc = statement.exc
+        raised = exc.func if isinstance(exc, ast.Call) else exc
+        if isinstance(raised, ast.Name):
+            return raised.id
+    return None
+
+
+def _stub_marker(node: DefinitionNode, vocabulary: Vocabulary) -> str | None:
+    """The stub a body is: nothing but a placeholder the vocabulary names, or
+    a body that raises an exception the vocabulary names, whatever precedes
+    the raise."""
+    form = _placeholder(node)
+    if form is not None and form in vocabulary.stubs:
+        return form
+    return next(
+        (
+            name
+            for statement in node.body
+            if (name := _raised(statement)) is not None and name in vocabulary.stubs
+        ),
+        None,
+    )
+
+
+def _callee(call: ast.Call) -> str:
+    return ast.unparse(call.func)
+
+
+def _imported_callee(call: ast.Call, imported: Mapping[str, str]) -> str:
+    """A call's callee read through the file's imports (`nap` bound by
+    `from time import sleep as nap` is `time.sleep`)."""
+    parts = chain(call.func)
+    return _callee(call) if parts is None else expanded(parts, imported)
+
+
+def _body(
+    node: DefinitionNode,
+    text: str,
+    vocabulary: Vocabulary,
+    imported: Mapping[str, str],
+) -> Body:
+    statements = node.body
+    first, last = statements[0], statements[-1]
+    lines = source_lines(text)[first.lineno - 1 : (last.end_lineno or last.lineno)]
+    sleeps = sorted(
+        {
+            n.lineno
+            for n in own_nodes(node)
+            if isinstance(n, ast.Call)
+            and (
+                vocabulary.is_sleep(_callee(n))
+                or vocabulary.is_sleep(_imported_callee(n, imported))
+            )
+        }
+    )
+    marker = _stub_marker(node, vocabulary)
+    markers = (marker,) if marker is not None else ()
+    return Body("\n".join(lines), markers, tuple(sleeps))
+
+
+def _definition(
+    path: str,
+    found: _Found,
+    text: str,
+    declaration: Declaration,
+    regions: Sequence[Region],
+    vocabulary: Vocabulary,
+    imported: Mapping[str, str],
+) -> Definition:
+    node = found.node
+    is_type = isinstance(node, ast.ClassDef)
+    unit = Unit(
+        path,
+        UnitKind.TYPE if is_type else UnitKind.FUNCTION,
+        found.symbol,
+        node.lineno,
+        node.end_lineno or node.lineno,
+        layer_of(path, node.lineno, declaration, regions),
+    )
+    return Definition(
+        unit=unit,
+        signature=None if isinstance(node, ast.ClassDef) else _signature(node),
+        body=_body(node, text, vocabulary, imported),
+        bases=tuple(ast.unparse(b) for b in node.bases)
+        if isinstance(node, ast.ClassDef)
+        else (),
+        decorators=tuple(ast.unparse(d) for d in node.decorator_list),
+        parent=found.parent,
+        nested=found.nested,
+    )
+
+
+def _scoped(
+    tree: ast.Module, found: Sequence[_Found]
+) -> list[tuple[str | None, ast.AST]]:
+    """Every node of a file with the symbol of the definition it sits in."""
+    nodes: list[tuple[str | None, ast.AST]] = [(None, n) for n in own_nodes(tree)]
+    for f in found:
+        nodes.extend((f.symbol, n) for n in own_nodes(f.node))
+    return nodes
+
+
+def _docstrings(tree: ast.Module) -> set[int]:
+    """The ids of every docstring constant in a file."""
+    owners = [tree, *(n for n in ast.walk(tree) if isinstance(n, DEFINITIONS))]
+    found: set[int] = set()
+    for owner in owners:
+        first = owner.body[0] if owner.body else None
+        if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+            found.add(id(first.value))
+    return found
+
+
+def _chain(node: ast.expr) -> bool:
+    """Whether an expression is a dotted chain of names (os.environ.get)."""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return isinstance(node, ast.Name)
+
+
+def _references(
+    path: str, tree: ast.Module, scoped: Sequence[tuple[str | None, ast.AST]]
+) -> list[Reference]:
+    docstrings = _docstrings(tree)
+    inner = {
+        id(n.value) for _, n in scoped if isinstance(n, ast.Attribute) and _chain(n)
+    }
+    found: list[Reference] = []
+    for within, node in scoped:
+        if id(node) in inner:
+            continue
+        if isinstance(node, ast.Attribute) and _chain(node):
+            text, kind = ast.unparse(node), ReferenceKind.NAME
+        elif isinstance(node, ast.Name):
+            text, kind = node.id, ReferenceKind.NAME
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstrings
+        ):
+            text, kind = node.value, ReferenceKind.STRING
+        else:
+            continue
+        found.append(Reference(path, node.lineno, within, kind, text))
+    return found
+
+
+def _call(path: str, within: str | None, node: ast.Call, resolver: Resolver) -> Call:
+    parts = chain(node.func)
+    target = None if parts is None else resolver.target(path, within, parts)
+    return Call(path, node.lineno, within, _callee(node), target=target)
+
+
+GETATTR = "getattr"
+
+
+def _getattr_reach(
+    path: str, within: str | None, node: ast.Call, resolver: Resolver
+) -> Call | None:
+    """The attribute a builtin `getattr` with a literal name reads, as a call
+    to it (`getattr(rules, "_round")` reaches `rules._round`)."""
+    if not (isinstance(node.func, ast.Name) and node.func.id == GETATTR):
+        return None
+    if resolver.target(path, within, [GETATTR]) is not None or len(node.args) < 2:
+        return None
+    owner, name = chain(node.args[0]), node.args[1]
+    if owner is None or not (
+        isinstance(name, ast.Constant) and isinstance(name.value, str)
+    ):
+        return None
+    parts = [*owner, name.value]
+    target = resolver.target(path, within, parts)
+    return Call(path, node.lineno, within, ".".join(parts), target=target)
+
+
+def _calls(
+    path: str, scoped: Sequence[tuple[str | None, ast.AST]], resolver: Resolver
+) -> list[Call]:
+    """Every call, and every attribute a `getattr` reads by a literal name."""
+    found: list[Call] = []
+    for within, node in scoped:
+        if not isinstance(node, ast.Call):
+            continue
+        found.append(_call(path, within, node, resolver))
+        reach = _getattr_reach(path, within, node, resolver)
+        if reach is not None:
+            found.append(reach)
+    return found
+
+
+def _accesses(
+    path: str, scoped: Sequence[tuple[str | None, ast.AST]], vocabulary: Vocabulary
+) -> list[Access]:
+    inner = {
+        id(n.value) for _, n in scoped if isinstance(n, ast.Attribute) and _chain(n)
+    }
+    found: list[Access] = []
+    for within, node in scoped:
+        if isinstance(node, ast.Global):
+            found.extend(
+                Access(path, node.lineno, within, AccessKind.GLOBAL, name)
+                for name in node.names
+            )
+        elif isinstance(node, ast.Attribute | ast.Name) and id(node) not in inner:
+            text = ast.unparse(node)
+            if vocabulary.reads_environment(text):
+                found.append(
+                    Access(path, node.lineno, within, AccessKind.ENVIRONMENT, text)
+                )
+    return found
+
+
+def _unpacked(target: ast.expr) -> list[ast.expr]:
+    """The single targets inside a tuple, list or starred target."""
+    if isinstance(target, ast.Tuple | ast.List):
+        return [single for element in target.elts for single in _unpacked(element)]
+    if isinstance(target, ast.Starred):
+        return _unpacked(target.value)
+    return [target]
+
+
+def _assigned(node: ast.AST) -> list[ast.expr]:
+    """Every single target a statement binds: assignments, for loops and
+    with blocks, through any unpacking."""
+    if isinstance(node, ast.Assign):
+        targets = list(node.targets)
+    elif isinstance(node, ast.AugAssign | ast.AnnAssign | ast.For | ast.AsyncFor):
+        targets = [node.target]
+    elif isinstance(node, ast.With | ast.AsyncWith):
+        targets = [i.optional_vars for i in node.items if i.optional_vars is not None]
+    else:
+        targets = []
+    return [single for target in targets for single in _unpacked(target)]
+
+
+def _writes(path: str, scoped: Sequence[tuple[str | None, ast.AST]]) -> list[Write]:
+    return [
+        Write(path, target.lineno, within, ast.unparse(target.value), target.attr)
+        for within, node in scoped
+        for target in _assigned(node)
+        if isinstance(target, ast.Attribute)
+    ]
+
+
+def _imported(node: ast.Import | ast.ImportFrom) -> list[tuple[str, str]]:
+    """The names an import binds and the dotted names they name: an
+    aliased module, or each name taken from a module (relative ones keep
+    their leading dots). A star import binds nothing it names."""
+    if isinstance(node, ast.Import):
+        return [(a.asname, a.name) for a in node.names if a.asname is not None]
+    module = "." * node.level + (node.module or "")
+    joiner = "." if node.module else ""
+    return [
+        (a.asname or a.name, f"{module}{joiner}{a.name}")
+        for a in node.names
+        if a.name != "*"
+    ]
+
+
+def _bound(node: ast.AST) -> list[tuple[str, str]]:
+    """The name a statement binds to a dotted name, and what it names: one
+    name assigned a name chain, or an import's names."""
+    if isinstance(node, ast.Import | ast.ImportFrom):
+        return _imported(node)
+    if isinstance(node, ast.Assign) and len(node.targets) == 1:
+        target, value = node.targets[0], node.value
+    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        target, value = node.target, node.value
+    else:
+        return []
+    if isinstance(target, ast.Name) and _chain(value):
+        return [(target.id, ast.unparse(value))]
+    return []
+
+
+def _bindings(path: str, scoped: Sequence[tuple[str | None, ast.AST]]) -> list[Binding]:
+    return [
+        Binding(path, node.lineno, within, name, value)
+        for within, node in scoped
+        if isinstance(node, ast.stmt)
+        for name, value in _bound(node)
+    ]
+
+
+def _discriminants(test: ast.expr) -> list[str]:
+    """What a branch's test discriminates on: the left of a comparison, the
+    value an isinstance tests, each operand of a bool op, a bare name."""
+    if isinstance(test, ast.BoolOp):
+        return [d for value in test.values for d in _discriminants(value)]
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        return _discriminants(test.operand)
+    if isinstance(test, ast.Compare):
+        return [ast.unparse(test.left)]
+    if isinstance(test, ast.Call):
+        if _callee(test) == "isinstance" and test.args:
+            return [ast.unparse(test.args[0])]
+        return [_callee(test)]
+    return [ast.unparse(test)]
+
+
+def _conditionals(
+    path: str, scoped: Sequence[tuple[str | None, ast.AST]]
+) -> list[Conditional]:
+    found: list[Conditional] = []
+    for within, node in scoped:
+        if isinstance(node, ast.If | ast.While | ast.IfExp):
+            tests = _discriminants(node.test)
+        elif isinstance(node, ast.Match):
+            tests = [ast.unparse(node.subject)]
+        else:
+            continue
+        found.extend(Conditional(path, node.lineno, within, t) for t in tests)
+    return found
+
+
+SELF = "self"
+
+
+def _self_fields(method: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.Attribute]:
+    """The `self.<field> = ...` targets in a method."""
+    return [
+        target
+        for node in own_nodes(method)
+        for target in _assigned(node)
+        if isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == SELF
+    ]
+
+
+def _type_members(path: str, found: _Found) -> list[Member]:
+    """One type's declared fields, methods and self-assigned fields, in order."""
+    members: list[Member] = []
+    for statement in found.node.body:
+        if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
+            members.append(
+                Member(
+                    path,
+                    found.symbol,
+                    statement.name,
+                    MemberKind.METHOD,
+                    statement.lineno,
+                )
+            )
+            members.extend(
+                Member(path, found.symbol, t.attr, MemberKind.FIELD, t.lineno)
+                for t in _self_fields(statement)
+            )
+        else:
+            members.extend(
+                Member(path, found.symbol, t.id, MemberKind.FIELD, t.lineno)
+                for t in _assigned(statement)
+                if isinstance(t, ast.Name)
+            )
+    return members
+
+
+def _members(path: str, walked: Sequence[_Found]) -> list[Member]:
+    """Every type's members, each name once, at its first occurrence."""
+    first: dict[tuple[str, str], Member] = {}
+    for f in walked:
+        if isinstance(f.node, ast.ClassDef):
+            for member in _type_members(path, f):
+                first.setdefault((member.owner, member.name), member)
+    return list(first.values())
+
+
+TEST_PREFIX = "test"
+TEST_CLASS_PREFIX = "Test"
+
+
+def is_test(found: _Found, classes: set[str]) -> bool:
+    """Whether a definition is a test: a function named test* at module
+    level, or a method named test* of a class named Test*."""
+    if isinstance(found.node, ast.ClassDef) or not found.node.name.startswith(
+        TEST_PREFIX
+    ):
+        return False
+    if found.parent is None:
+        return True
+    return found.parent in classes and found.parent.split(".")[-1].startswith(
+        TEST_CLASS_PREFIX
+    )
+
+
+def _assertion(node: ast.Assert) -> Assertion:
+    """An assert statement's expression, with its truth value when it is a
+    literal, and whether it carries a message."""
+    try:
+        truth: bool | None = bool(ast.literal_eval(node.test))
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        truth = None
+    return Assertion(ast.unparse(node.test), truth, node.msg is not None)
+
+
+def _test_cases(path: str, walked: Sequence[_Found]) -> list[TestCase]:
+    classes = {f.symbol for f in walked if isinstance(f.node, ast.ClassDef)}
+    cases: list[TestCase] = []
+    for f in walked:
+        if not is_test(f, classes):
+            continue
+        nodes = own_nodes(f.node)
+        calls = tuple(_callee(n) for n in nodes if isinstance(n, ast.Call))
+        asserts = tuple(_assertion(n) for n in nodes if isinstance(n, ast.Assert))
+        cases.append(TestCase(path, f.symbol, f.node.lineno, calls, asserts))
+    return cases
+
+
+NESTED_TOO_DEEPLY = "nested deeper than the analyzer can walk"
+
+
+@dataclass(frozen=True, slots=True)
+class _Parsed:
+    """The sources that parsed, each with its definitions, and the rest."""
+
+    trees: dict[str, ast.Module]
+    walked: dict[str, list[_Found]]
+    unparsed: list[Unparsed]
+
+
+def _file_names(
+    tree: ast.Module, walked: Sequence[_Found], module: str | None, is_package: bool
+) -> FileNames:
+    """What one parsed file binds, for the resolver."""
+    bases = {
+        f.symbol: tuple(
+            tuple(parts) for b in f.node.bases if (parts := chain(b)) is not None
+        )
+        for f in walked
+        if isinstance(f.node, ast.ClassDef)
+    }
+    return FileNames(
+        module=module,
+        imported=imported_names(tree, module, is_package),
+        defined=frozenset(f.symbol for f in walked),
+        bases=bases,
+    )
+
+
+def _resolver(
+    trees: Mapping[str, ast.Module],
+    sources: Mapping[str, bytes],
+    walked: Mapping[str, Sequence[_Found]],
+) -> Resolver:
+    """The resolver over every parsed file."""
+    parsed = {path: sources[path] for path in trees}
+    module_of = modules_of(parsed)
+    files = {
+        path: _file_names(
+            tree,
+            walked[path],
+            module_of.get(path),
+            path.rpartition("/")[2] == INIT,
+        )
+        for path, tree in trees.items()
+    }
+    return Resolver(files=files, modules=module_names(parsed))
+
+
+def _file_model(
+    path: str,
+    data: bytes,
+    walked: Sequence[_Found],
+    declaration: Declaration,
+    regions: Sequence[Region],
+    vocabulary: Vocabulary,
+    resolver: Resolver,
+    tree: ast.Module,
+) -> CodeModel:
+    """Every fact of one parsed file, as a CodeModel of that file alone."""
+    text = data.decode("utf-8", "replace")
+    lines = len(source_lines(text))
+    file_unit = Unit(
+        path, UnitKind.FILE, None, 1, lines, layer_of(path, None, declaration)
+    )
+    imported = resolver.imported(path)
+    found = [
+        _definition(path, f, text, declaration, regions, vocabulary, imported)
+        for f in walked
+    ]
+    scoped = _scoped(tree, walked)
+    return CodeModel(
+        units=(file_unit, *(d.unit for d in found)),
+        definitions=tuple(found),
+        references=tuple(_references(path, tree, scoped)),
+        calls=tuple(_calls(path, scoped, resolver)),
+        accesses=tuple(_accesses(path, scoped, vocabulary)),
+        writes=tuple(_writes(path, scoped)),
+        bindings=tuple(_bindings(path, scoped)),
+        conditionals=tuple(_conditionals(path, scoped)),
+        members=tuple(_members(path, walked)),
+        test_cases=tuple(_test_cases(path, walked)),
+    )
+
+
+# --- Adapter -----------------------------------------------------------------
+
+
+class PythonCodeModel:
+    """CodeModelPort over Python sources. The clock is the edge's own, read
+    before each file and handed to the import analyzer."""
+
+    def __init__(
+        self, *, bound: float | None = None, clock: Callable[[], float] = time.time
+    ) -> None:
+        self._bound = bound
+        self._clock = clock
+
+    def _parse(
+        self, sources: Mapping[str, bytes], deadline: Deadline | None
+    ) -> _Parsed | TimedOut:
+        """Every source parsed and its definitions walked, in path order, or
+        Unparsed with the reason."""
+        parsed = _Parsed({}, {}, [])
+        for path in sorted(sources):
+            if _passed(deadline, self._clock()):
+                return TimedOut("model the Python sources")
+            tree = _parse(path, sources[path])
+            if isinstance(tree, Unparsed):
+                parsed.unparsed.append(tree)
+                continue
+            try:
+                parsed.walked[path] = _walk_definitions(tree)
+            except RecursionError:
+                parsed.unparsed.append(Unparsed(path, NESTED_TOO_DEEPLY))
+                continue
+            parsed.trees[path] = tree
+        return parsed
+
+    def model(
+        self,
+        sources: Mapping[str, bytes],
+        declaration: Declaration,
+        vocabulary: Vocabulary,
+        deadline: Deadline | None,
+    ) -> CodeModel | TimedOut:
+        if _passed(deadline, self._clock()):
+            return TimedOut("model the Python sources")
+        found = tuple(
+            region
+            for path in declaration.layers.marker_files
+            if path in sources
+            for region in marker_regions(
+                path, sources[path].decode("utf-8", "replace"), vocabulary
+            )
+        )
+        declared = tuple(r for r in declaration.layers.regions if r.path in sources)
+        read = self._parse(sources, deadline)
+        if isinstance(read, TimedOut):
+            return read
+        unparsed = list(read.unparsed)
+        resolver = _resolver(read.trees, sources, read.walked)
+        files: list[CodeModel] = []
+        trees: dict[str, ast.Module] = {}
+        for path, tree in read.trees.items():
+            if _passed(deadline, self._clock()):
+                return TimedOut("model the Python sources")
+            try:
+                files.append(
+                    _file_model(
+                        path,
+                        sources[path],
+                        read.walked[path],
+                        declaration,
+                        found,
+                        vocabulary,
+                        resolver,
+                        tree,
+                    )
+                )
+            except RecursionError:
+                unparsed.append(Unparsed(path, NESTED_TOO_DEEPLY))
+                continue
+            trees[path] = tree
+        try:
+            imports, not_modelled = import_edges(
+                sources, trees, deadline, self._clock, self._bound
+            )
+            unparsed.extend(not_modelled)
+        except ImportGraphFailed as failure:
+            if failure.timed_out:
+                return TimedOut(str(failure))
+            imports = []
+            unparsed.extend(Unparsed(path, str(failure)) for path in trees)
+        return replace(
+            merged(files),
+            imports=tuple(imports),
+            regions=declared + found,
+            unparsed=tuple(unparsed),
+        )

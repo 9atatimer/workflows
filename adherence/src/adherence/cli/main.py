@@ -1,0 +1,412 @@
+"""cli/main.py -- the adhere CLI: parse, call the use cases, present.
+
+Holds no workflow step and constructs no adapter: container.build binds
+the ports for the stage `--stage` names (ARCHITECTURE.ARCH-ADHERENCE.md,
+Module map). It computes the Deadline, the one place the engine turns a
+bound into an instant: the hook's from the commit-time bound, ci's from
+the time the job says it has left; in the hook it calls judge_bounded
+instead of judge_change. It prints the report through the presenter
+`--format` names, writes each further format `--write` names to its
+file, and maps the verdict to the exit status per stage.
+Declaration text is author-controlled, so control characters are
+stripped before it reaches the terminal (Security mitigations).
+"""
+
+from __future__ import annotations
+
+import math
+import sys
+import time
+from collections.abc import Callable, Mapping
+from pathlib import Path
+
+import click
+
+from adherence.application.bounded import judge_bounded
+from adherence.application.judge import judge_change
+from adherence.application.load import check_declarations, load_declaration
+from adherence.application.measure import measure
+from adherence.application.record import record_report
+from adherence.cli.presenters.json_report import report_json
+from adherence.cli.presenters.plain import without_controls
+from adherence.cli.presenters.sarif import report_sarif
+from adherence.cli.presenters.summary import report_summary
+from adherence.cli.presenters.terminal import report_text
+from adherence.container import Container, Stage, build
+from adherence.domain.deadline import Deadline
+from adherence.domain.declaration import (
+    DECLARATION_PATH,
+    VOCABULARY_REFUSAL,
+    Declaration,
+    DeclarationUnreadable,
+    RefusedExemption,
+)
+from adherence.domain.report import Recorded, Report, Verdict
+from adherence.domain.target import Base, Change, Head
+
+# --- Constants ---------------------------------------------------------------
+
+# The verdicts `adhere judge` exits non-zero on, per stage. Lowered fails a
+# gate, and not run never reads as a pass, in every stage. Inconclusive
+# never fails a gate in any stage (the design's Key Decisions, Inconclusive
+# at the gate): the commit proceeds in the hook, and the change merges at
+# ci, with the report naming what was not covered.
+FAILING: Mapping[Stage, frozenset[Verdict]] = {
+    Stage.LAPTOP: frozenset({Verdict.LOWERED, Verdict.NOT_RUN}),
+    Stage.HOOK: frozenset({Verdict.LOWERED, Verdict.NOT_RUN}),
+    Stage.CI: frozenset({Verdict.LOWERED, Verdict.NOT_RUN}),
+    Stage.CLOUD: frozenset({Verdict.LOWERED, Verdict.NOT_RUN}),
+}
+# The output formats: terminal lines (the default), the machine form,
+# SARIF 2.1.0, and the PR job summary's markdown.
+FORMATS = {
+    "terminal": report_text,
+    "json": report_json,
+    "sarif": report_sarif,
+    "summary": report_summary,
+}
+FORMAT_OPTION = click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(sorted(FORMATS)),
+    default=None,
+    help="How the report is printed: terminal lines (the default), JSON, "
+    "SARIF 2.1.0, or the PR job summary in markdown.",
+)
+JSON_OPTION = click.option(
+    "--json", "as_json", is_flag=True, help="Print the report as JSON (--format json)."
+)
+WRITE_OPTION = click.option(
+    "--write",
+    "writes",
+    type=(click.Choice(sorted(FORMATS)), click.Path(dir_okay=False)),
+    multiple=True,
+    metavar="FORMAT PATH",
+    help="Also write the report in FORMAT to PATH; repeatable (the workflow's "
+    "SARIF file and job summary).",
+)
+
+# --- Presenters --------------------------------------------------------------
+
+
+def _safe(text: str) -> str:
+    """Author-controlled text as the terminal may show it."""
+    return without_controls(text)
+
+
+def _refusal_line(refusal: RefusedExemption) -> str:
+    exemption = refusal.exemption
+    target = exemption.finding or f"{exemption.check} on {exemption.unit}"
+    return _safe(f"  refused exemption: {target}: {refusal.reason}")
+
+
+def _file_lines(path: str, read: Declaration | DeclarationUnreadable) -> list[str]:
+    """One declaration file: its path, whether it reads, its exemptions,
+    and each exemption and vocabulary it states that the suite refuses."""
+    if isinstance(read, DeclarationUnreadable):
+        return [_safe(f"{path}: unreadable: {read.reason}")]
+    stated = read
+    count = len(stated.exemptions)
+    return [
+        _safe(f"{path}: readable, {count} exemption{'s' if count != 1 else ''}"),
+        *map(_refusal_line, stated.refused_exemptions),
+        *(
+            _safe(f"  refused vocabulary: {key}: {VOCABULARY_REFUSAL}")
+            for key in stated.vocabulary.refused
+        ),
+    ]
+
+
+def _declaration_lines(
+    files: tuple[tuple[str, Declaration | DeclarationUnreadable], ...]
+    | DeclarationUnreadable,
+    merged: Declaration | DeclarationUnreadable,
+) -> list[str]:
+    """A line per declaration file found, then the merge's refusal when
+    every file reads and they cannot be read as one."""
+    if isinstance(files, DeclarationUnreadable):
+        return [_safe(f"declaration unreadable: {files.reason}")]
+    if not files:
+        return [f"{DECLARATION_PATH}: none; the repository is measured as undeclared"]
+    lines = [line for path, read in files for line in _file_lines(path, read)]
+    every_file_reads = not any(
+        isinstance(read, DeclarationUnreadable) for _, read in files
+    )
+    if isinstance(merged, DeclarationUnreadable) and every_file_reads:
+        lines.append(_safe(f"governing declarations unreadable: {merged.reason}"))
+    return lines
+
+
+def _presenter(format_name: str | None, as_json: bool) -> Callable[..., str]:
+    """The presenter the flags name, the terminal's when they name none; a
+    usage error when they name two: `--json` is `--format json`, so beside
+    another format it is a conflict, never a silent loser."""
+    if as_json and format_name not in (None, "json"):
+        raise click.UsageError(
+            f"--json is --format json; it conflicts with --format {format_name}"
+        )
+    if format_name is None:
+        format_name = "json" if as_json else "terminal"
+    return FORMATS[format_name]
+
+
+def _write_reports(
+    writes: tuple[tuple[str, str], ...], report: Report, recorded: Recorded | None
+) -> None:
+    """Each further format `--write` names, written whole to its path.
+    Every write is attempted; when any fails, the run ends naming each
+    path that could not be written and why, never with a traceback."""
+    failed: list[str] = []
+    for output_format, path in writes:
+        target = Path(path)
+        rendered = FORMATS[output_format](report, recorded)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(rendered.rstrip("\n") + "\n")
+        except OSError as error:
+            failed.append(f"{path} ({error.strerror or error})")
+    if failed:
+        raise click.ClickException(f"could not write {'; '.join(failed)}")
+
+
+# --- Entry points ------------------------------------------------------------
+
+
+def _chosen_stage(ctx: click.Context) -> Stage | None:
+    """The stage `--stage` named on the command line, if it named one."""
+    name = ctx.find_root().params.get("stage")
+    return Stage(name) if isinstance(name, str) else None
+
+
+def _judging_stage(ctx: click.Context, staged: bool) -> Stage:
+    """The stage a judgement runs in: the one named, else the hook for the
+    staged index and the laptop for revisions. Only the hook judges the
+    staged index, and the hook judges nothing else."""
+    stage = _chosen_stage(ctx) or (Stage.HOOK if staged else Stage.LAPTOP)
+    if staged and stage is not Stage.HOOK:
+        raise click.UsageError(f"--staged is the hook's; not the {stage.value} stage")
+    if not staged and stage is Stage.HOOK:
+        raise click.UsageError("the hook stage judges the staged index: give --staged")
+    return stage
+
+
+@click.group()
+@click.option(
+    "--stage",
+    type=click.Choice([stage.value for stage in Stage]),
+    help="The place this run is in, which binds its judge, reviews and "
+    "bound: laptop (the default), hook (judge --staged), ci (the gate) or "
+    "cloud.",
+)
+def main(stage: str | None) -> None:
+    """adhere -- measure a repository against its own declared architecture."""
+
+
+@main.group()
+def declaration() -> None:
+    """The repository's adherence.toml files."""
+
+
+@declaration.command("check")
+@click.option(
+    "--root",
+    default=".",
+    show_default=True,
+    type=click.Path(exists=True, file_okay=False),
+    help="The repository whose working tree is read.",
+)
+@click.pass_context
+def declaration_check(ctx: click.Context, root: str) -> None:
+    """Read every adherence.toml in the working tree and say whether each,
+    and all of them as one, can be read."""
+    container = build(_chosen_stage(ctx) or Stage.LAPTOP, root=root)
+    files, merged = check_declarations(
+        Head.working_tree(), repository=container.repository, deadline=None
+    )
+    for line in _declaration_lines(files, merged):
+        click.echo(line)
+    if isinstance(merged, DeclarationUnreadable):
+        sys.exit(1)
+
+
+@main.command("measure")
+@click.option(
+    "--root",
+    default=".",
+    show_default=True,
+    type=click.Path(exists=True, file_okay=False),
+    help="The repository whose working tree is measured.",
+)
+@FORMAT_OPTION
+@JSON_OPTION
+@click.pass_context
+def measure_command(
+    ctx: click.Context, root: str, format_name: str | None, as_json: bool
+) -> None:
+    """Measure the working tree and print the report.
+
+    A test passes the composition root, bound with its fakes, as the
+    context object.
+    """
+    present = _presenter(format_name, as_json)
+    builder: Callable[..., Container] = ctx.obj if callable(ctx.obj) else build
+    container = builder(_chosen_stage(ctx) or Stage.LAPTOP, root=root)
+    head = Head.working_tree()
+    report = measure(
+        head,
+        load_declaration(head, repository=container.repository, deadline=None),
+        repository=container.repository,
+        analyzers=container.analyzers,
+        complexity=container.complexity,
+        duplication=container.duplication,
+        records=container.records,
+        judge=container.judge,
+        parameters=container.parameters,
+        deadline=None,
+    )
+    click.echo(present(report).rstrip("\n"))
+    if report.not_run_reason is not None:
+        sys.exit(1)
+
+
+def _finite_seconds(
+    ctx: click.Context, param: click.Parameter, value: float | None
+) -> float | None:
+    """A time left that is a finite number of seconds: nan and infinity
+    name no instant, so they are refused rather than taken as unbounded
+    (a job with no limit gives no --time-left)."""
+    if value is not None and not math.isfinite(value):
+        raise click.BadParameter("give a finite number of seconds", ctx, param)
+    return value
+
+
+def _ci_deadline(stage: Stage, time_left: float | None) -> Deadline | None:
+    """The Deadline of a judgement of revisions: in ci, the job's remaining
+    time from now when the job gives it; nowhere else is a run of
+    revisions bounded."""
+    if time_left is None:
+        return None
+    if stage is not Stage.CI:
+        raise click.UsageError(
+            f"--time-left is the ci job's; not the {stage.value} stage"
+        )
+    return Deadline(epoch_seconds=time.time() + time_left)
+
+
+def _judge_revisions(
+    container: Container,
+    root: str,
+    base: str,
+    head: str,
+    deadline: Deadline | None,
+) -> Report:
+    change = Change(
+        repository=container.name,
+        base=Base(base),
+        head=Head.at_revision(head),
+    )
+    return judge_change(
+        change,
+        repository=container.repository,
+        reviews=container.reviews,
+        analyzers=container.analyzers,
+        complexity=container.complexity,
+        duplication=container.duplication,
+        records=container.records,
+        judge=container.judge,
+        reports=container.reports,
+        parameters=container.parameters,
+        deadline=deadline,
+    )
+
+
+def _judge_staged(container: Container, root: str) -> Report:
+    bound = container.parameters.limits.commit_time_bound
+    if container.worker is None or bound is None:
+        raise click.UsageError("the hook stage binds no worker or no time bound")
+    change = Change(
+        repository=container.name,
+        base=Base(container.staged_base),
+        head=Head.staged_index(),
+    )
+    return judge_bounded(
+        change,
+        worker=container.worker,
+        deadline=Deadline(epoch_seconds=time.time() + bound),
+        repository=container.repository,
+        reviews=container.reviews,
+        analyzers=container.analyzers,
+        complexity=container.complexity,
+        duplication=container.duplication,
+        records=container.records,
+        judge=container.judge,
+        reports=container.reports,
+        parameters=container.parameters,
+    )
+
+
+@main.command("judge")
+@click.option(
+    "--root",
+    default=".",
+    show_default=True,
+    type=click.Path(exists=True, file_okay=False),
+    help="The repository whose revisions are judged.",
+)
+@click.option("--base", help="The revision judged against.")
+@click.option("--head", help="The revision judged.")
+@click.option(
+    "--staged",
+    is_flag=True,
+    help="Judge the staged index against HEAD -- git's empty tree before the "
+    "first commit -- within the commit-time bound (the pre-commit hook).",
+)
+@click.option(
+    "--time-left",
+    type=click.FloatRange(min=0),
+    callback=_finite_seconds,
+    help="Seconds the ci job has left, a finite number (nan and inf are "
+    "refused; omit it for no bound): the checks unfinished by then are "
+    "coverage (ci only).",
+)
+@FORMAT_OPTION
+@JSON_OPTION
+@WRITE_OPTION
+@click.pass_context
+def judge_command(
+    ctx: click.Context,
+    root: str,
+    base: str | None,
+    head: str | None,
+    staged: bool,
+    time_left: float | None,
+    format_name: str | None,
+    as_json: bool,
+    writes: tuple[tuple[str, str], ...],
+) -> None:
+    """Judge the head revision against the base, or the staged index
+    against HEAD (git's empty tree before the first commit), and print the
+    report.
+
+    The report is kept after the verdict is reached, so keeping it can
+    never change the verdict. A test passes the composition root, bound
+    with its fakes, as the context object.
+    """
+    present = _presenter(format_name, as_json)
+    if staged == (base is not None or head is not None) or (
+        not staged and (base is None or head is None)
+    ):
+        raise click.UsageError("give --base and --head, or --staged alone")
+    stage = _judging_stage(ctx, staged)
+    deadline = _ci_deadline(stage, time_left)
+    builder: Callable[..., Container] = ctx.obj if callable(ctx.obj) else build
+    container = builder(stage, root=root)
+    if base is not None and head is not None:
+        report = _judge_revisions(container, root, base, head, deadline)
+    else:
+        report = _judge_staged(container, root)
+    recorded = record_report(report, reports=container.reports)
+    click.echo(present(report, recorded).rstrip("\n"))
+    _write_reports(writes, report, recorded)
+    if report.verdict in FAILING[stage]:
+        sys.exit(1)
